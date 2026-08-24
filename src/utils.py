@@ -17,7 +17,6 @@ def load_pickle(file_path):
         return pickle.load(f)
 
 def save_experiment_report(content_dict, report_path="data/processed/reporte_ultimo_experimento.txt"):
-    """Sobrescribe el reporte con los parámetros y métricas del último entrenamiento ejecutado."""
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("=" * 65 + "\n")
