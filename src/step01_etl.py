@@ -25,7 +25,6 @@ def run_etl():
         infer_schema_length=10000,
         ignore_errors=True
     )
-    total_raw = df_raw.height
 
     print("[ETL 2/5] Casteando tipos y limpiando UBIGEOS...")
     df_clean = df_raw.with_columns([
@@ -83,22 +82,38 @@ def run_etl():
     features = config["data_processing"]["features"]
     F = len(features)
 
-    data_tensor = np.zeros((T, N, F), dtype=np.float32)
+    # 1. Tensor base (T, N, 6)
+    base_tensor = np.zeros((T, N, 6), dtype=np.float32)
     pdf = agg_df.to_pandas()
 
     for row in pdf.itertuples():
         t_i = time_to_idx.get((row.ano, row.semana))
         n_i = ubigeo_to_idx.get(row.ubigeo)
         if t_i is not None and n_i is not None:
-            data_tensor[t_i, n_i, :] = [
+            base_tensor[t_i, n_i, :] = [
                 row.ep_men5, row.hosp_men5, row.def_men5,
                 row.ep_may5, row.hosp_may5, row.def_may5
             ]
 
-    print("[ETL 4/5] Generando matriz binaria de brotes...")
-    target_idx = config["model_params"]["target_idx"]
-    target_series = data_tensor[:, :, target_idx]
-    
+    print("[ETL 4/5] Generando ingenieria de caracteristicas (10 variables)...")
+    data_tensor = np.zeros((T, N, F), dtype=np.float32)
+    data_tensor[:, :, 0:6] = base_tensor
+
+    # Feature 6: Delta casos (Velocidad de contagio)
+    delta_cases = np.zeros((T, N), dtype=np.float32)
+    delta_cases[1:] = base_tensor[1:, :, 0] - base_tensor[:-1, :, 0]
+    data_tensor[:, :, 6] = delta_cases
+
+    # Feature 7: Ratio de hospitalización
+    data_tensor[:, :, 7] = base_tensor[:, :, 1] / (base_tensor[:, :, 0] + 1.0)
+
+    # Features 8 y 9: Seno y Coseno de la semana epidemiológica
+    for t_i, (y, s) in enumerate(time_index):
+        data_tensor[t_i, :, 8] = np.sin(2 * np.pi * s / 53.0)
+        data_tensor[t_i, :, 9] = np.cos(2 * np.pi * s / 53.0)
+
+    # Matriz de Brotes
+    target_series = data_tensor[:, :, 0]
     outbreak_matrix = np.zeros((T, N), dtype=np.int64)
     pct = config["data_processing"]["outbreak_percentile"]
     
@@ -121,7 +136,7 @@ def run_etl():
         "districts_catalog": unique_districts.to_dicts()
     }
     save_pickle(metadata, os.path.join(processed_dir, "metadata.pkl"))
-    print(f"ETL finalizado: {valid_df.height:,} de {total_raw:,} filas procesadas ({T} semanas x {N} distritos).")
+    print(f"ETL finalizado con exito: Tensor final {data_tensor.shape} ({F} características).")
 
 if __name__ == "__main__":
     run_etl()

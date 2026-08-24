@@ -7,8 +7,7 @@ paths:
 data_processing:
   start_year: 2000
   end_year: 2024
-  min_reporting_ratio: 0.10  # Excluye distritos con menos del 10% de semanas con reportes
-  outbreak_percentile: 75    # Percentil para definir brote epidémico (F1-score)
+  outbreak_percentile: 75
   features:
     - "ep_men5"
     - "hosp_men5"
@@ -16,14 +15,18 @@ data_processing:
     - "ep_may5"
     - "hosp_may5"
     - "def_may5"
+    - "delta_ep_men5"
+    - "ratio_hosp_men5"
+    - "sem_sin"
+    - "sem_cos"
 
 model_params:
-  seq_len: 8          # Ventana histórica de entrada (8 semanas)
-  pred_horizon: 1     # Horizonte de predicción (1 semana a futuro)
-  target_idx: 0       # 0 = ep_men5
-  train_split: 0.70   # 2000 - ~2017
-  val_split: 0.15     # ~2017 - ~2021
-  test_split: 0.15    # ~2021 - 2024
+  seq_len: 8
+  pred_horizon: 1
+  target_idx: 0
+  train_split: 0.70
+  val_split: 0.15
+  test_split: 0.15
   batch_size: 32
   learning_rate: 0.001
   epochs: 100
