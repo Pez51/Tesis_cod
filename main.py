@@ -1,25 +1,37 @@
-import os
 import sys
 from src.step01_etl import run_etl
+from src.step02_graph_builder import build_spatial_graph
 
 def main():
-    print("="*50)
-    print(" PIPELINE ST-GNN: PRECAUCIÓN DE EDA EN PERÚ")
-    print("="*50)
+    print("="*55)
+    print(" PIPELINE ST-GNN: MODELADO EPIDEMIOLÓGICO DE EDA")
+    print("="*55)
 
-    # 1. Fase de ETL y Limpieza
-    print("\n[FASE 1] Iniciando Extracción, Transformación y Carga...")
+    # FASE 1: Limpieza y Creación de Tensores
+    print("\n[FASE 1] Extracción, Transformación y Carga (ETL)...")
     try:
         run_etl()
     except Exception as e:
-        print(f"Error durante el ETL: {e}")
+        print(f"Error en Fase 1: {e}")
         sys.exit(1)
-        
-    print("\nFase 1 completada. Revisa la carpeta 'data/processed/' para ver los tensores generados.")
-    
-    # Aquí iremos agregando las siguientes fases conforme avancemos:
-    # 2. Generación de Grafo (step02_graph_builder.py)
-    # 3. Entrenamiento (step05_train_eval.py)
+
+    # FASE 2: Descarga de Cartografía y Construcción del Grafo
+    print("\n[FASE 2] Descarga Cartográfica y Construcción de Topología...")
+    try:
+        build_spatial_graph()
+    except Exception as e:
+        print(f"Error en Fase 2: {e}")
+        sys.exit(1)
+
+    print("\n" + "="*55)
+    print(" FASES 1 Y 2 COMPLETADAS EXITOSAMENTE")
+    print(" Artefactos generados en 'data/processed/':")
+    print("  - df_master_weekly.parquet")
+    print("  - tensor_eda_TNF.npy")
+    print("  - targets_outbreak.npy")
+    print("  - adj_matrix.npy")
+    print("  - graph_topology.pt")
+    print("="*55)
 
 if __name__ == "__main__":
     main()
