@@ -12,6 +12,20 @@ from src.utils import load_config, save_experiment_report
 from src.step03_dataset import get_dataloaders
 from src.step04_model_stgcn import SpatioTemporalGNN
 
+# Implementación de Focal Loss para clases minoritarias
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.75, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        bce_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        probs = torch.sigmoid(logits)
+        pt = targets * probs + (1 - targets) * (1 - probs)
+        focal_weight = (self.alpha * targets + (1 - self.alpha) * (1 - targets)) * ((1 - pt) ** self.gamma)
+        return (focal_weight * bce_loss).mean()
+
 def find_optimal_threshold(y_true, y_probs):
     thresholds = np.linspace(0.1, 0.9, 81)
     best_thresh = 0.5
@@ -32,7 +46,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     plt.figure(figsize=(8, 5))
     plt.plot(history["train_loss"], label="Train Loss", color="#1f77b4", linewidth=2)
     plt.plot(history["val_loss"], label="Val Loss", color="#ff7f0e", linewidth=2)
-    plt.title("Evolución de la Pérdida Multitarea", fontsize=13, fontweight="bold")
+    plt.title("Evolución de la Pérdida (Huber + Focal Loss)", fontsize=13, fontweight="bold")
     plt.xlabel("Épocas")
     plt.ylabel("Loss")
     plt.legend()
@@ -106,16 +120,16 @@ def train_and_evaluate():
     train_loader, val_loader, test_loader, scalers = get_dataloaders()
     graph_data = torch.load(os.path.join(processed_dir, "graph_topology.pt"), weights_only=False)
     edge_index = graph_data["edge_index"].to(device)
+    num_nodes = graph_data["num_nodes"]
 
     num_features = len(config["data_processing"]["features"])
-    model = SpatioTemporalGNN(in_features=num_features, hidden_dim=64, dropout=0.2).to(device)
+    model = SpatioTemporalGNN(num_nodes=num_nodes, in_features=num_features, embed_dim=16, hidden_dim=64, dropout=0.2).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["model_params"]["learning_rate"], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     criterion_reg = nn.HuberLoss(delta=1.0)
-    pos_weight = torch.tensor([scalers["pos_weight"]], device=device)
-    criterion_cls = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion_cls = FocalLoss(alpha=0.75, gamma=2.0)
 
     epochs = config["model_params"]["epochs"]
     best_val_loss = float("inf")
@@ -123,12 +137,11 @@ def train_and_evaluate():
     patience_counter = 0
     best_model_path = os.path.join(models_dir, "best_stgnn_model.pt")
 
-    # Si existe un checkpoint antiguo incompatible, se elimina
     if os.path.exists(best_model_path):
         os.remove(best_model_path)
 
     history = {"train_loss": [], "val_loss": []}
-    print(f"[ENTRENAMIENTO] Iniciando entrenamiento con 10 variables ({epochs} épocas máx)...")
+    print(f"[ENTRENAMIENTO] Iniciando ciclo con Node Embeddings y Focal Loss ({epochs} épocas)...")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -144,7 +157,7 @@ def train_and_evaluate():
 
             loss_reg = criterion_reg(pred_reg, batch_y_reg)
             loss_cls = criterion_cls(pred_cls, batch_y_cls)
-            total_loss = loss_reg + 0.6 * loss_cls
+            total_loss = loss_reg + 1.2 * loss_cls
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -164,7 +177,7 @@ def train_and_evaluate():
                 pred_reg, pred_cls = model(batch_x, edge_index)
                 l_reg = criterion_reg(pred_reg, batch_y_reg)
                 l_cls = criterion_cls(pred_cls, batch_y_cls)
-                val_loss += (l_reg + 0.6 * l_cls).item()
+                val_loss += (l_reg + 1.2 * l_cls).item()
 
         avg_val_loss = val_loss / len(val_loader)
         scheduler.step(avg_val_loss)
@@ -248,7 +261,8 @@ def train_and_evaluate():
     report_data = {
         "CONFIGURACIÓN DEL EXPERIMENTO": {
             "Dispositivo": str(device),
-            "Características": "10 variables (Ingeniería espaciotemporal)",
+            "Arquitectura": "ST-GNN + Node Embeddings (16d)",
+            "Pérdida": "HuberLoss (Regresión) + FocalLoss (Clasificación)",
             "Épocas ejecutadas": len(history["train_loss"]),
             "Umbral óptimo calibrado": f"{best_threshold:.2f}"
         },
@@ -266,7 +280,7 @@ def train_and_evaluate():
     save_experiment_report(report_data)
 
     print("\n" + "="*55)
-    print(" EVALUACIÓN FINALIZADA CON ÉXITO")
+    print(" EVALUACIÓN FINALIZADA")
     print(f" -> RMSE: {rmse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
     print(f" -> F1-Macro: {f1_macro:.4f} | AUC-ROC: {roc_auc:.4f} (Umbral: {best_threshold:.2f})")
     print("="*55 + "\n")
