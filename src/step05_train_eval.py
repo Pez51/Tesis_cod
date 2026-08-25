@@ -13,7 +13,6 @@ from src.step03_dataset import get_dataloaders
 from src.step04_model_stgcn import SpatioTemporalGNN
 
 def find_optimal_threshold(y_true, y_probs):
-    """Encuentra el umbral de probabilidad que maximiza el F1-Macro en validación."""
     thresholds = np.linspace(0.1, 0.9, 81)
     best_thresh = 0.5
     best_f1 = 0.0
@@ -33,7 +32,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     plt.figure(figsize=(8, 5))
     plt.plot(history["train_loss"], label="Train Loss", color="#1f77b4", linewidth=2)
     plt.plot(history["val_loss"], label="Val Loss", color="#ff7f0e", linewidth=2)
-    plt.title("Evolución de la Función de Pérdida (Multitarea)", fontsize=13, fontweight="bold")
+    plt.title("Evolución de la Pérdida Multitarea", fontsize=13, fontweight="bold")
     plt.xlabel("Épocas")
     plt.ylabel("Loss")
     plt.legend()
@@ -63,7 +62,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     axes[0].plot(fpr, tpr, color="#2ca02c", lw=2, label=f"AUC-ROC = {roc_auc:.3f}")
     axes[0].plot([0, 1], [0, 1], color="gray", linestyle="--")
-    axes[0].set_title("Curva ROC (Detección de Brotes)", fontweight="bold")
+    axes[0].set_title("Curva ROC (Brotes)", fontweight="bold")
     axes[0].set_xlabel("Tasa Falsos Positivos")
     axes[0].set_ylabel("Tasa Verdaderos Positivos")
     axes[0].legend(loc="lower right")
@@ -124,6 +123,10 @@ def train_and_evaluate():
     patience_counter = 0
     best_model_path = os.path.join(models_dir, "best_stgnn_model.pt")
 
+    # Si existe un checkpoint antiguo incompatible, se elimina
+    if os.path.exists(best_model_path):
+        os.remove(best_model_path)
+
     history = {"train_loss": [], "val_loss": []}
     print(f"[ENTRENAMIENTO] Iniciando entrenamiento con 10 variables ({epochs} épocas máx)...")
 
@@ -183,11 +186,10 @@ def train_and_evaluate():
                 print(f"[EARLY STOPPING] Detenido en la época {epoch}.")
                 break
 
-    # Cargar mejor modelo
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
 
-    # 1. Calibrar umbral sobre Validación
+    # 1. Calibrar umbral en Validación
     val_probs_cls, val_targets_cls = [], []
     with torch.no_grad():
         for batch_x, _, batch_y_cls in val_loader:
@@ -201,13 +203,13 @@ def train_and_evaluate():
     best_threshold, val_f1 = find_optimal_threshold(y_val_true, y_val_prob)
     print(f"\n[CALIBRACIÓN] Umbral óptimo calculado en Validación: {best_threshold:.2f} (F1-Val: {val_f1:.4f})")
 
-    # 2. Evaluación ciega en Test
+    # 2. Evaluación en Test
     print("[EVALUACIÓN] Evaluando sobre conjunto de Prueba (Test)...")
     all_preds_reg, all_targets_reg = [], []
     all_probs_cls, all_targets_cls = [], []
 
-    mean_val = scalers["mean"]
-    std_val = scalers["std"]
+    mean_val = scalers["mean_target"]
+    std_val = scalers["std_target"]
 
     with torch.no_grad():
         for batch_x, batch_y_reg, batch_y_cls in test_loader:
@@ -231,8 +233,6 @@ def train_and_evaluate():
     y_pred_reg = np.concatenate(all_preds_reg, axis=0).flatten()
     y_true_cls = np.concatenate(all_targets_cls, axis=0).flatten()
     y_prob_cls = np.concatenate(all_probs_cls, axis=0).flatten()
-    
-    # Inferencia con umbral calibrado
     y_pred_cls = (y_prob_cls >= best_threshold).astype(int)
 
     rmse = float(np.sqrt(mean_squared_error(y_true_reg, y_pred_reg)))
@@ -248,7 +248,7 @@ def train_and_evaluate():
     report_data = {
         "CONFIGURACIÓN DEL EXPERIMENTO": {
             "Dispositivo": str(device),
-            "Características": "10 variables (incluye estacionalidad y delta)",
+            "Características": "10 variables (Ingeniería espaciotemporal)",
             "Épocas ejecutadas": len(history["train_loss"]),
             "Umbral óptimo calibrado": f"{best_threshold:.2f}"
         },
@@ -266,7 +266,7 @@ def train_and_evaluate():
     save_experiment_report(report_data)
 
     print("\n" + "="*55)
-    print(" EVALUACIÓN FINAL CON 10 FEATURES Y UMBRAL CALIBRADO")
+    print(" EVALUACIÓN FINALIZADA CON ÉXITO")
     print(f" -> RMSE: {rmse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
     print(f" -> F1-Macro: {f1_macro:.4f} | AUC-ROC: {roc_auc:.4f} (Umbral: {best_threshold:.2f})")
     print("="*55 + "\n")

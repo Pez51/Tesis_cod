@@ -10,9 +10,9 @@ class SpatioTemporalEDADataset(Dataset):
         T, N, F = data_tensor.shape
 
         for t in range(T - seq_len - pred_horizon + 1):
-            x_window = data_tensor[t : t + seq_len]                                      # (P, N, F)
-            y_reg = data_tensor[t + seq_len + pred_horizon - 1, :, target_idx]           # (N,)
-            y_cls = outbreak_matrix[t + seq_len + pred_horizon - 1, :]                   # (N,)
+            x_window = data_tensor[t : t + seq_len]
+            y_reg = data_tensor[t + seq_len + pred_horizon - 1, :, target_idx]
+            y_cls = outbreak_matrix[t + seq_len + pred_horizon - 1, :]
 
             self.X.append(x_window)
             self.Y_reg.append(y_reg)
@@ -42,22 +42,25 @@ def get_dataloaders():
     train_end = int(T * train_ratio)
     val_end = int(T * (train_ratio + val_ratio))
 
-    # 1. Transformación Logarítmica: log(1 + x) para estabilizar la varianza
-    data_log = np.log1p(data_tensor)
+    # 1. Transformación diferenciada: log1p solo a conteos (0..5)
+    transformed_tensor = np.zeros_like(data_tensor, dtype=np.float32)
+    transformed_tensor[:, :, 0:6] = np.log1p(np.maximum(data_tensor[:, :, 0:6], 0.0))
+    transformed_tensor[:, :, 6:] = data_tensor[:, :, 6:]
 
-    train_raw = data_log[:train_end]
-    val_raw = data_log[train_end:val_end]
-    test_raw = data_log[val_end:]
+    train_raw = transformed_tensor[:train_end]
+    val_raw = transformed_tensor[train_end:val_end]
+    test_raw = transformed_tensor[val_end:]
 
-    # 2. Estandarización Z-Score basada únicamente en el conjunto Train
+    # 2. Estandarización Z-Score calculada únicamente sobre Train
     mean = np.mean(train_raw, axis=(0, 1), keepdims=True)
-    std = np.std(train_raw, axis=(0, 1), keepdims=True) + 1e-5
+    std = np.std(train_raw, axis=(0, 1), keepdims=True)
+    std[std < 1e-5] = 1.0  # Prevenir división por cero
 
     train_norm = (train_raw - mean) / std
     val_norm = (val_raw - mean) / std
     test_norm = (test_raw - mean) / std
 
-    # 3. Cálculo de pos_weight para balancear la pérdida BCE de brotes
+    # 3. Factor de balance para brotes
     train_outbreaks = outbreak_matrix[:train_end]
     num_pos = np.sum(train_outbreaks == 1)
     num_neg = np.sum(train_outbreaks == 0)
@@ -77,11 +80,11 @@ def get_dataloaders():
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
     scalers = {
-        "mean": float(mean[:, :, target_idx].squeeze()),
-        "std": float(std[:, :, target_idx].squeeze()),
+        "mean_target": float(mean[:, :, target_idx].squeeze()),
+        "std_target": float(std[:, :, target_idx].squeeze()),
         "pos_weight": pos_weight
     }
 
-    print(f"[DATASET] Muestras -> Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
-    print(f"[DATASET] Factor de balance de brotes (pos_weight): {pos_weight:.2f}")
+    print(f"[DATASET] Partición -> Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
+    print(f"[DATASET] Balance de brotes (pos_weight): {pos_weight:.2f}")
     return train_loader, val_loader, test_loader, scalers
