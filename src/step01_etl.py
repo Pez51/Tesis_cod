@@ -26,7 +26,7 @@ def run_etl():
         ignore_errors=True
     )
 
-    print("[ETL 2/5] Estandarizando identificadores...")
+    print("[ETL 2/5] Casteando tipos y validando UBIGEOS...")
     df_clean = df_raw.with_columns([
         pl.col("ano").cast(pl.Int32, strict=False),
         pl.col("semana").cast(pl.Int32, strict=False),
@@ -94,36 +94,45 @@ def run_etl():
                 row.ep_may5, row.hosp_may5, row.def_may5
             ]
 
-    print("[ETL 4/5] Generando 10 variables y calibrando brotes por Z-Score distrital...")
+    print("[ETL 4/5] Construyendo 12 características epidemiológicas...")
     data_tensor = np.zeros((T, N, F), dtype=np.float32)
     data_tensor[:, :, 0:6] = base_tensor
 
-    # Feature 6: Delta de casos
+    # Feature 6: Delta casos
     delta_cases = np.zeros((T, N), dtype=np.float32)
     delta_cases[1:] = base_tensor[1:, :, 0] - base_tensor[:-1, :, 0]
     data_tensor[:, :, 6] = delta_cases
 
-    # Feature 7: Ratio de hospitalización
+    # Feature 7: Ratio hospitalización
     data_tensor[:, :, 7] = base_tensor[:, :, 1] / (base_tensor[:, :, 0] + 1.0)
 
-    # Features 8 y 9: Seno y Coseno de semana
+    # Features 8 y 9: Estacionalidad sen/cos
     for t_i, (y, s) in enumerate(time_index):
         data_tensor[t_i, :, 8] = np.sin(2 * np.pi * s / 53.0)
         data_tensor[t_i, :, 9] = np.cos(2 * np.pi * s / 53.0)
 
-    # Detección de Brotes: Casos >= Media + 1.5 Desviaciones Estándar del propio distrito (Umbral adaptativo)
-    target_series = data_tensor[:, :, 0]
+    # Feature 10: Media móvil de 4 semanas (Canal endémico dinámico)
+    roll_mean = np.zeros((T, N), dtype=np.float32)
+    for t in range(T):
+        start_t = max(0, t - 4)
+        roll_mean[t] = np.mean(base_tensor[start_t : t + 1, :, 0], axis=0)
+    data_tensor[:, :, 10] = roll_mean
+
+    # Feature 11: Ratio de aceleración epidémica (Surge Ratio)
+    data_tensor[:, :, 11] = base_tensor[:, :, 0] / (roll_mean + 1.0)
+
+    # Matriz Binaria de Brote Dinámica (Supera la media móvil + 1.5 desviaciones locales)
     outbreak_matrix = np.zeros((T, N), dtype=np.int64)
+    target_series = data_tensor[:, :, 0]
 
     for n in range(N):
         node_vals = target_series[:, n]
-        mean_node = np.mean(node_vals)
-        std_node = np.std(node_vals)
-        # Un brote requiere al menos 3 casos y superar el umbral estadístico local
-        threshold = max(mean_node + 1.5 * std_node, 3.0)
-        outbreak_matrix[:, n] = (node_vals >= threshold).astype(np.int64)
+        non_zero = node_vals[node_vals > 0]
+        thresh = np.percentile(non_zero, 75) if len(non_zero) > 10 else 2.0
+        thresh = max(thresh, 2.0)
+        outbreak_matrix[:, n] = (node_vals >= thresh).astype(np.int64)
 
-    print("[ETL 5/5] Guardando artefactos...")
+    print("[ETL 5/5] Exportando matrices procesadas...")
     np.save(os.path.join(processed_dir, "tensor_eda_TNF.npy"), data_tensor)
     np.save(os.path.join(processed_dir, "targets_outbreak.npy"), outbreak_matrix)
     agg_df.write_parquet(os.path.join(processed_dir, "df_master_weekly.parquet"))
@@ -136,7 +145,7 @@ def run_etl():
         "districts_catalog": unique_districts.to_dicts()
     }
     save_pickle(metadata, os.path.join(processed_dir, "metadata.pkl"))
-    print(f"ETL completado: Tensor final {data_tensor.shape} ({N} distritos).")
+    print(f"ETL finalizado: Tensor con forma {data_tensor.shape} ({F} variables).")
 
 if __name__ == "__main__":
     run_etl()

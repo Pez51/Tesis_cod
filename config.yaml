@@ -19,6 +19,8 @@ data_processing:
     - "ratio_hosp_men5"
     - "sem_sin"
     - "sem_cos"
+    - "roll_mean_4"
+    - "surge_ratio"
 
 model_params:
   seq_len: 8
