@@ -26,7 +26,7 @@ def run_etl():
         ignore_errors=True
     )
 
-    print("[ETL 2/5] Casteando tipos y validando UBIGEOS...")
+    print("[ETL 2/5] Casteando tipos y validando identificadores...")
     df_clean = df_raw.with_columns([
         pl.col("ano").cast(pl.Int32, strict=False),
         pl.col("semana").cast(pl.Int32, strict=False),
@@ -79,8 +79,12 @@ def run_etl():
     ubigeo_to_idx = {u: i for i, u in enumerate(valid_ubigeos)}
     N = len(valid_ubigeos)
 
-    features = config["data_processing"]["features"]
-    F = len(features)
+    features = [
+        "ep_men5", "hosp_men5", "def_men5", "ep_may5", "hosp_may5", "def_may5",
+        "delta_ep_men5", "ratio_hosp_men5", "sem_sin", "sem_cos",
+        "roll_mean_4", "surge_ratio", "lag_provincial_ep"
+    ]
+    F = len(features)  # Exactamente 13
 
     base_tensor = np.zeros((T, N, 6), dtype=np.float32)
     pdf = agg_df.to_pandas()
@@ -94,7 +98,7 @@ def run_etl():
                 row.ep_may5, row.hosp_may5, row.def_may5
             ]
 
-    print("[ETL 4/5] Construyendo 12 características epidemiológicas...")
+    print(f"[ETL 4/5] Construyendo {F} variables y calculando retardo espacial provincial...")
     data_tensor = np.zeros((T, N, F), dtype=np.float32)
     data_tensor[:, :, 0:6] = base_tensor
 
@@ -111,30 +115,46 @@ def run_etl():
         data_tensor[t_i, :, 8] = np.sin(2 * np.pi * s / 53.0)
         data_tensor[t_i, :, 9] = np.cos(2 * np.pi * s / 53.0)
 
-    # Feature 10: Media móvil de 4 semanas (Canal endémico dinámico)
+    # Feature 10: Media móvil 4 semanas
     roll_mean = np.zeros((T, N), dtype=np.float32)
     for t in range(T):
         start_t = max(0, t - 4)
         roll_mean[t] = np.mean(base_tensor[start_t : t + 1, :, 0], axis=0)
     data_tensor[:, :, 10] = roll_mean
 
-    # Feature 11: Ratio de aceleración epidémica (Surge Ratio)
+    # Feature 11: Surge ratio
     data_tensor[:, :, 11] = base_tensor[:, :, 0] / (roll_mean + 1.0)
 
-    # Matriz Binaria de Brote Dinámica (Supera la media móvil + 1.5 desviaciones locales)
+    # Feature 12: Retardo espacial provincial (promedio de casos en la provincia en t-1)
+    prov_dict = {}
+    for idx, u in enumerate(valid_ubigeos):
+        prov_code = u[:4]
+        prov_dict.setdefault(prov_code, []).append(idx)
+
+    spatial_lag = np.zeros((T, N), dtype=np.float32)
+    for prov, indices in prov_dict.items():
+        if len(indices) > 0:
+            prov_cases = np.mean(base_tensor[:, indices, 0], axis=1, keepdims=True)
+            spatial_lag[1:, indices] = prov_cases[:-1]
+    data_tensor[:, :, 12] = spatial_lag
+
+    # Matriz Binaria de Brote y Umbrales
     outbreak_matrix = np.zeros((T, N), dtype=np.int64)
+    district_thresholds = np.zeros(N, dtype=np.float32)
     target_series = data_tensor[:, :, 0]
 
     for n in range(N):
         node_vals = target_series[:, n]
         non_zero = node_vals[node_vals > 0]
         thresh = np.percentile(non_zero, 75) if len(non_zero) > 10 else 2.0
-        thresh = max(thresh, 2.0)
+        thresh = max(float(thresh), 2.0)
+        district_thresholds[n] = thresh
         outbreak_matrix[:, n] = (node_vals >= thresh).astype(np.int64)
 
-    print("[ETL 5/5] Exportando matrices procesadas...")
+    print("[ETL 5/5] Guardando matrices procesadas...")
     np.save(os.path.join(processed_dir, "tensor_eda_TNF.npy"), data_tensor)
     np.save(os.path.join(processed_dir, "targets_outbreak.npy"), outbreak_matrix)
+    np.save(os.path.join(processed_dir, "district_thresholds.npy"), district_thresholds)
     agg_df.write_parquet(os.path.join(processed_dir, "df_master_weekly.parquet"))
 
     metadata = {
@@ -142,10 +162,11 @@ def run_etl():
         "ubigeo_to_idx": ubigeo_to_idx,
         "time_index": time_index,
         "features": features,
-        "districts_catalog": unique_districts.to_dicts()
+        "districts_catalog": unique_districts.to_dicts(),
+        "district_thresholds": district_thresholds
     }
     save_pickle(metadata, os.path.join(processed_dir, "metadata.pkl"))
-    print(f"ETL finalizado: Tensor con forma {data_tensor.shape} ({F} variables).")
+    print(f"ETL completado: Tensor guardado con forma {data_tensor.shape} ({F} variables).")
 
 if __name__ == "__main__":
     run_etl()

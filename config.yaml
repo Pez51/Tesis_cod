@@ -21,14 +21,17 @@ data_processing:
     - "sem_cos"
     - "roll_mean_4"
     - "surge_ratio"
+    - "lag_provincial_ep"
 
 model_params:
-  seq_len: 8
+  seq_len: 12
   pred_horizon: 1
   target_idx: 0
   train_split: 0.70
   val_split: 0.15
   test_split: 0.15
-  batch_size: 32
-  learning_rate: 0.001
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0008
+  hidden_dim: 64
   epochs: 100

@@ -1,4 +1,6 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import time
 from datetime import datetime, timedelta
 import torch
@@ -17,30 +19,44 @@ from src.step04_model_stgcn import SpatioTemporalGNN
 def format_seconds(seconds):
     return str(timedelta(seconds=int(seconds)))
 
-class CalibratedFocalLoss(nn.Module):
-    def __init__(self, alpha=0.70, gamma=2.0):
-        super(CalibratedFocalLoss, self).__init__()
+# Focal Tversky Loss: Penaliza 3 veces más a los Falsos Negativos que a los Falsos Positivos
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha=0.25, beta=0.75, gamma=1.33, eps=1e-6):
+        super(FocalTverskyLoss, self).__init__()
         self.alpha = alpha
+        self.beta = beta
         self.gamma = gamma
+        self.eps = eps
 
     def forward(self, logits, targets):
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         probs = torch.sigmoid(logits)
-        pt = targets * probs + (1 - targets) * (1 - probs)
-        focal_weight = (self.alpha * targets + (1 - self.alpha) * (1 - targets)) * ((1 - pt) ** self.gamma)
-        return (focal_weight * bce_loss).mean()
+        
+        tp = torch.sum(probs * targets)
+        fp = torch.sum(probs * (1.0 - targets))
+        fn = torch.sum((1.0 - probs) * targets)
+        
+        tversky_idx = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
+        focal_tversky = torch.pow(1.0 - tversky_idx, 1.0 / self.gamma)
+        return focal_tversky
 
-def find_optimal_threshold(y_true, y_probs):
-    thresholds = np.linspace(0.05, 0.85, 161)
-    best_thresh = 0.35
+def find_optimal_hybrid_weights(y_true, y_probs, y_reg_preds, thresholds_vec):
+    y_reg_indicator = (y_reg_preds >= thresholds_vec).astype(float)
+    
     best_f1 = 0.0
-    for th in thresholds:
-        preds = (y_probs >= th).astype(int)
-        score = f1_score(y_true, preds, average="macro", zero_division=0)
-        if score > best_f1:
-            best_f1 = score
-            best_thresh = th
-    return best_thresh, best_f1
+    best_alpha = 0.5
+    best_cutoff = 0.5
+
+    for alpha in [0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9]:
+        combined_score = alpha * y_probs + (1.0 - alpha) * y_reg_indicator
+        for cutoff in np.linspace(0.15, 0.80, 66):
+            preds = (combined_score >= cutoff).astype(int)
+            score = f1_score(y_true, preds, average="macro", zero_division=0)
+            if score > best_f1:
+                best_f1 = score
+                best_alpha = alpha
+                best_cutoff = cutoff
+
+    return best_alpha, best_cutoff, best_f1
 
 def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cls, y_pred_cls, figures_dir):
     os.makedirs(figures_dir, exist_ok=True)
@@ -50,9 +66,9 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     plt.figure(figsize=(8, 5))
     plt.plot(history["train_loss"], label="Train Loss", color="#1f77b4", linewidth=2)
     plt.plot(history["val_loss"], label="Val Loss", color="#ff7f0e", linewidth=2)
-    plt.title("Evolución de la Función de Pérdida (ST-GNN)", fontsize=12, fontweight="bold")
+    plt.title("Evolución de Pérdida (Huber + Focal Tversky Loss)", fontsize=12, fontweight="bold")
     plt.xlabel("Épocas")
-    plt.ylabel("Pérdida")
+    plt.ylabel("Loss")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(figures_dir, "01_curvas_aprendizaje.png"), dpi=300)
@@ -64,7 +80,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm_norm, annot=True, fmt=".2%", cmap="Blues", cbar=False,
                 xticklabels=["Normal (0)", "Brote (1)"], yticklabels=["Normal (0)", "Brote (1)"])
-    plt.title("Matriz de Confusión Calibrada (Brotes Locales)", fontsize=12, fontweight="bold")
+    plt.title("Matriz de Confusión Calibrada (Brotes Epidémicos)", fontsize=12, fontweight="bold")
     plt.xlabel("Predicción del Modelo")
     plt.ylabel("Estado Real Notificado")
     plt.tight_layout()
@@ -80,7 +96,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     axes[0].plot(fpr, tpr, color="#2ca02c", lw=2, label=f"AUC-ROC = {roc_auc:.3f}")
     axes[0].plot([0, 1], [0, 1], color="gray", linestyle="--")
-    axes[0].set_title("Curva ROC (Detección de Brotes)", fontweight="bold")
+    axes[0].set_title("Curva ROC (Brotes)", fontweight="bold")
     axes[0].set_xlabel("Tasa Falsos Positivos")
     axes[0].set_ylabel("Tasa Verdaderos Positivos")
     axes[0].legend(loc="lower right")
@@ -119,27 +135,31 @@ def train_and_evaluate():
     os.makedirs(figures_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n[ENTRENAMIENTO] Dispositivo de cómputo: {device}")
+    print(f"\n[ENTRENAMIENTO] Dispositivo activo: {device}")
     if torch.cuda.is_available():
-        print(f" -> GPU Activa: {torch.cuda.get_device_name(0)}")
-        torch.backends.cudnn.benchmark = True  # Optimización de hardware
+        print(f" -> GPU: {torch.cuda.get_device_name(0)}")
+        torch.cuda.empty_cache()
 
     train_loader, val_loader, test_loader, scalers = get_dataloaders()
     graph_data = torch.load(os.path.join(processed_dir, "graph_topology.pt"), weights_only=False)
     edge_index = graph_data["edge_index"].to(device)
     num_nodes = graph_data["num_nodes"]
 
+    thresholds_path = os.path.join(processed_dir, "district_thresholds.npy")
+    district_thresholds = np.load(thresholds_path) if os.path.exists(thresholds_path) else np.full(num_nodes, 2.0)
+
+    hidden_dim = config["model_params"].get("hidden_dim", 64)
+    accum_steps = config["model_params"].get("gradient_accumulation_steps", 4)
     num_features = len(config["data_processing"]["features"])
-    model = SpatioTemporalGNN(num_nodes=num_nodes, in_features=num_features, embed_dim=16, hidden_dim=64, dropout=0.2).to(device)
+
+    model = SpatioTemporalGNN(num_nodes=num_nodes, in_features=num_features, embed_dim=16, hidden_dim=hidden_dim, dropout=0.15).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["model_params"]["learning_rate"], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=25, T_mult=1, eta_min=1e-5)
-    
-    # Escalador de Precisión Mixta (AMP)
-    scaler_amp = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scaler_amp = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
     criterion_reg = nn.HuberLoss(delta=1.0)
-    criterion_cls = CalibratedFocalLoss(alpha=0.70, gamma=2.0)
+    criterion_tversky = FocalTverskyLoss(alpha=0.25, beta=0.75, gamma=1.33)
 
     epochs = config["model_params"]["epochs"]
     best_val_loss = float("inf")
@@ -157,51 +177,54 @@ def train_and_evaluate():
     start_total_secs = time.time()
 
     print("\n" + "="*85)
-    print(f" INICIO DEL ENTRENAMIENTO | Hora de inicio: {time_start_global.strftime('%H:%M:%S')}")
+    print(f" ENTRENAMIENTO CON FOCAL TVERSKY LOSS | Inicio: {time_start_global.strftime('%H:%M:%S')}")
     print("="*85)
 
     for epoch in range(1, epochs + 1):
         epoch_start_time = time.time()
         model.train()
         train_loss = 0.0
+        optimizer.zero_grad()
 
-        for batch_x, batch_y_reg, batch_y_cls in train_loader:
+        for batch_idx, (batch_x, batch_y_reg, batch_y_cls) in enumerate(train_loader):
             batch_x = batch_x.to(device)
             batch_y_reg = batch_y_reg.to(device)
             batch_y_cls = batch_y_cls.to(device)
 
-            optimizer.zero_grad()
-
-            # Forward pass con AMP (Precisión Mixta FP16)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 pred_reg, pred_cls = model(batch_x, edge_index)
-                loss_reg = criterion_reg(pred_reg, batch_y_reg)
-                loss_cls = criterion_cls(pred_cls, batch_y_cls)
-                total_loss = loss_reg + 2.0 * loss_cls
+                
+                loss_r = criterion_reg(pred_reg, batch_y_reg)
+                loss_c = criterion_tversky(pred_cls, batch_y_cls)
+                total_loss = (loss_r + 2.5 * loss_c) / accum_steps
 
             scaler_amp.scale(total_loss).backward()
-            scaler_amp.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler_amp.step(optimizer)
-            scaler_amp.update()
 
-            train_loss += total_loss.item()
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler_amp.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler_amp.step(optimizer)
+                scaler_amp.update()
+                optimizer.zero_grad()
+
+            train_loss += total_loss.item() * accum_steps
 
         avg_train_loss = train_loss / len(train_loader)
 
+        torch.cuda.empty_cache()
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 for batch_x, batch_y_reg, batch_y_cls in val_loader:
                     batch_x = batch_x.to(device)
                     batch_y_reg = batch_y_reg.to(device)
                     batch_y_cls = batch_y_cls.to(device)
 
                     pred_reg, pred_cls = model(batch_x, edge_index)
-                    l_reg = criterion_reg(pred_reg, batch_y_reg)
-                    l_cls = criterion_cls(pred_cls, batch_y_cls)
-                    val_loss += (l_reg + 2.0 * l_cls).item()
+                    l_r = criterion_reg(pred_reg, batch_y_reg)
+                    l_c = criterion_tversky(pred_cls, batch_y_cls)
+                    val_loss += (l_r + 2.5 * l_c).item()
 
         avg_val_loss = val_loss / len(val_loader)
         scheduler.step()
@@ -217,7 +240,6 @@ def train_and_evaluate():
         current_lr = optimizer.param_groups[0]['lr']
         dur_str = f"{epoch_duration:.1f}s" if epoch_duration < 60 else f"{int(epoch_duration//60)}m {int(epoch_duration%60):02d}s"
 
-        # Registro con hora de reloj exacta
         print(f"[{epoch_end_dt.strftime('%H:%M:%S')}] Época [{epoch:03d}/{epochs:03d}] | "
               f"Duración: {dur_str} | Acumulado: {format_seconds(elapsed_total)} | "
               f"Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f} | LR: {current_lr:.6f}")
@@ -237,32 +259,48 @@ def train_and_evaluate():
     avg_epoch_secs = np.mean(epoch_times)
 
     print("\n" + "-"*65)
-    print(" CRONOGRAMA DE ENTRENAMIENTO REGISTRADO")
+    print(" CRONOGRAMA DE ENTRENAMIENTO")
     print("-"*65)
     print(f" Hora de Inicio        : {time_start_global.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f" Hora de Finalización  : {time_end_global.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f" Duración Total        : {format_seconds(total_train_secs)} ({total_train_secs/60:.2f} minutos)")
+    print(f" Duración Total        : {format_seconds(total_train_secs)} ({total_train_secs/60:.2f} min)")
     print(f" Tiempo Promedio/Época : {avg_epoch_secs:.2f} s")
     print(f" Épocas Ejecutadas     : {len(history['train_loss'])}")
     print("-"*65 + "\n")
 
-    # 1. Calibrar umbral en Validación
+    # 1. Calibración Híbrida en Validación
+    torch.cuda.empty_cache()
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
 
-    val_probs_cls, val_targets_cls = [], []
+    val_probs_cls, val_preds_reg, val_targets_cls = [], [], []
+    mean_val = scalers["mean_target"]
+    std_val = scalers["std_target"]
+
     with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
             for batch_x, _, batch_y_cls in val_loader:
                 batch_x = batch_x.to(device)
-                _, pred_cls = model(batch_x, edge_index)
+                pred_reg, pred_cls = model(batch_x, edge_index)
+
+                pred_log = pred_reg.cpu().numpy() * std_val + mean_val
+                real_pred_reg = np.clip(np.expm1(pred_log), a_min=0, a_max=None)
+
+                val_preds_reg.append(real_pred_reg)
                 val_probs_cls.append(torch.sigmoid(pred_cls).cpu().numpy())
                 val_targets_cls.append(batch_y_cls.numpy().astype(int))
 
     y_val_true = np.concatenate(val_targets_cls, axis=0).flatten()
     y_val_prob = np.concatenate(val_probs_cls, axis=0).flatten()
-    best_threshold, val_f1 = find_optimal_threshold(y_val_true, y_val_prob)
-    print(f"[CALIBRACIÓN] Umbral óptimo calculado en Validación: {best_threshold:.2f} (F1-Val: {val_f1:.4f})")
+    y_val_reg = np.concatenate(val_preds_reg, axis=0).flatten()
+
+    val_samples_count = len(val_loader.dataset)
+    val_thresholds_expanded = np.tile(district_thresholds, val_samples_count)
+
+    best_alpha, best_cutoff, val_f1 = find_optimal_hybrid_weights(
+        y_val_true, y_val_prob, y_val_reg, val_thresholds_expanded
+    )
+    print(f"[CALIBRACIÓN] Parámetros Óptimos -> Alpha: {best_alpha:.2f} | Corte: {best_cutoff:.2f} (F1-Val: {val_f1:.4f})")
 
     # 2. Evaluación en Test y Latencia
     print("[EVALUACIÓN] Evaluando sobre conjunto de Prueba (Test)...")
@@ -270,11 +308,8 @@ def train_and_evaluate():
     all_preds_reg, all_targets_reg = [], []
     all_probs_cls, all_targets_cls = [], []
 
-    mean_val = scalers["mean_target"]
-    std_val = scalers["std_target"]
-
     with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
             for batch_x, batch_y_reg, batch_y_cls in test_loader:
                 batch_x = batch_x.to(device)
                 pred_reg, pred_cls = model(batch_x, edge_index)
@@ -300,17 +335,21 @@ def train_and_evaluate():
     y_pred_reg = np.concatenate(all_preds_reg, axis=0).flatten()
     y_true_cls = np.concatenate(all_targets_cls, axis=0).flatten()
     y_prob_cls = np.concatenate(all_probs_cls, axis=0).flatten()
-    y_pred_cls = (y_prob_cls >= best_threshold).astype(int)
+
+    test_thresholds_expanded = np.tile(district_thresholds, total_test_samples)
+    y_reg_indicator = (y_pred_reg >= test_thresholds_expanded).astype(float)
+    y_hybrid_score = best_alpha * y_prob_cls + (1.0 - best_alpha) * y_reg_indicator
+    y_pred_cls = (y_hybrid_score >= best_cutoff).astype(int)
 
     rmse = float(np.sqrt(mean_squared_error(y_true_reg, y_pred_reg)))
     mae = float(mean_absolute_error(y_true_reg, y_pred_reg))
     r2 = float(r2_score(y_true_reg, y_pred_reg))
     f1_macro = float(f1_score(y_true_cls, y_pred_cls, average="macro"))
     f1_binary = float(f1_score(y_true_cls, y_pred_cls, average="binary"))
-    fpr, tpr, _ = roc_curve(y_true_cls, y_prob_cls)
+    fpr, tpr, _ = roc_curve(y_true_cls, y_hybrid_score)
     roc_auc = float(auc(fpr, tpr))
 
-    plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cls, y_pred_cls, figures_dir)
+    plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_hybrid_score, y_pred_cls, figures_dir)
 
     report_data = {
         "CRONOMETRAJE COMPUTACIONAL": {
@@ -327,11 +366,12 @@ def train_and_evaluate():
             "MAE": f"{mae:.4f} casos",
             "R² (Coef. Determinación)": f"{r2:.4f}"
         },
-        "MÉTRICAS DE CLASIFICACIÓN (DETECCIÓN DE BROTES)": {
+        "MÉTRICAS DE CLASIFICACIÓN (INFERENCIA HÍBRIDA)": {
             "F1-Score (Macro)": f"{f1_macro:.4f}",
             "F1-Score (Clase Brote)": f"{f1_binary:.4f}",
             "AUC-ROC": f"{roc_auc:.4f}",
-            "Umbral Óptimo Calibrado": f"{best_threshold:.2f}"
+            "Ponderación Alpha Híbrida": f"{best_alpha:.2f}",
+            "Umbral de Corte": f"{best_cutoff:.2f}"
         }
     }
     save_experiment_report(report_data)
@@ -341,7 +381,7 @@ def train_and_evaluate():
     print(f" -> Tiempo Total : {format_seconds(total_train_secs)} ({total_train_secs/60:.2f} min)")
     print(f" -> Latencia     : {latency_per_sample:.2f} ms por semana")
     print(f" -> RMSE         : {rmse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
-    print(f" -> F1-Macro     : {f1_macro:.4f} | AUC-ROC: {roc_auc:.4f} (Umbral: {best_threshold:.2f})")
+    print(f" -> F1-Macro     : {f1_macro:.4f} | AUC-ROC: {roc_auc:.4f} (Alpha: {best_alpha:.2f}, Corte: {best_cutoff:.2f})")
     print("="*65 + "\n")
 
 if __name__ == "__main__":
