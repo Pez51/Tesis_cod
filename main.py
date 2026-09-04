@@ -7,7 +7,7 @@ from src.step05_train_eval import train_and_evaluate
 
 def main():
     print("="*55)
-    print(" PIPELINE ST-GNN: MODELADO EPIDEMIOLÓGICO DE EDA")
+    print(" PIPELINE ST-GNN: MODELADO EPIDEMIOLOGICO DE EDA")
     print("="*55)
 
     config = load_config()
@@ -22,13 +22,13 @@ def main():
 
     # FASE 2: Topología del Grafo
     if not os.path.exists(os.path.join(processed_dir, "graph_topology.pt")):
-        print("\n[FASE 2] Construyendo topología del grafo...")
+        print("\n[FASE 2] Construyendo topologia del grafo...")
         build_spatial_graph()
     else:
-        print("\n[FASE 2] Topología existente. Omitiendo construcción.")
+        print("\n[FASE 2] Topologia existente. Omitiendo construccion.")
 
     # FASE 3, 4 y 5: Entrenamiento y Evaluación
-    print("\n[FASE 3, 4 y 5] Iniciando entrenamiento y evaluación del modelo...")
+    print("\n[FASE 3, 4 y 5] Iniciando entrenamiento y evaluacion del modelo...")
     try:
         train_and_evaluate()
     except Exception as e:

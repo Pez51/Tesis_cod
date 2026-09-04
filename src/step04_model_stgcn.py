@@ -25,23 +25,25 @@ class SpatioTemporalGNN(nn.Module):
         self.node_embeddings = nn.Embedding(num_nodes, embed_dim)
         self.in_proj = nn.Linear(in_features + embed_dim, hidden_dim)
         
-        # Convolución Espacial GAT
+        # Convolución Espacial con Skip Connections (Kapoor et al., 2020)
         self.gat1 = GATConv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout)
         self.norm1 = nn.LayerNorm(hidden_dim)
         
-        self.gat2 = GATConv(hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout)
+        # Recibe h1 concatenado con h0 original para evitar over-smoothing
+        self.gat2 = GATConv(hidden_dim * 2, hidden_dim, heads=1, concat=False, dropout=dropout)
         self.norm2 = nn.LayerNorm(hidden_dim)
         
-        # Recurrencia Temporal GRU + Atención
+        # Fusión Macro-Epidémica Global (STAN - Gao et al., 2021)
+        # Recibe la señal local (hidden_dim) + señal global max-pooled (hidden_dim)
         self.gru = nn.GRU(
-            input_size=hidden_dim,
+            input_size=hidden_dim * 2,
             hidden_size=hidden_dim,
             num_layers=1,
             batch_first=True
         )
         self.temp_attn = TemporalAttention(hidden_dim)
         
-        # Cabezal 1: Regresión Continua
+        # Cabezal de Regresión Continua
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim, 32),
             nn.LayerNorm(32),
@@ -50,13 +52,13 @@ class SpatioTemporalGNN(nn.Module):
             nn.Linear(32, 1)
         )
         
-        # Cabezal 2: Clasificación de Brotes Dual-Stream
+        # Cabezal de Clasificación de Brotes Informado
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim + 1, 32),
-            nn.LayerNorm(32),
+            nn.Linear(hidden_dim + 1 + embed_dim, 48),
+            nn.LayerNorm(48),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 1)
+            nn.Linear(48, 1)
         )
         
         self.gelu = nn.GELU()
@@ -88,10 +90,19 @@ class SpatioTemporalGNN(nn.Module):
             h1 = self.norm1(h0 + self.gelu(h_gat1))
             h1 = self.dropout(h1)
             
-            h_gat2 = self.gat2(h1, batch_edge_index)
+            # Skip connection de Kapoor et al.: concatena h1 con h0
+            h1_cat = torch.cat([h1, h0], dim=-1)
+            h_gat2 = self.gat2(h1_cat, batch_edge_index)
             h2 = self.norm2(h1 + self.gelu(h_gat2))
             
-            spatial_outputs.append(h2.reshape(B, N, -1))
+            # Macro-Pooling de STAN: Extrae el pulso epidémico nacional en la semana t
+            h2_reshaped = h2.reshape(B, N, -1)
+            global_wave, _ = torch.max(h2_reshaped, dim=1, keepdim=True) # (B, 1, hidden_dim)
+            global_wave_exp = global_wave.expand(-1, N, -1)               # (B, N, hidden_dim)
+            
+            # Concatenación de contexto local + macro nacional
+            h2_fused = torch.cat([h2_reshaped, global_wave_exp], dim=-1) # (B, N, hidden_dim * 2)
+            spatial_outputs.append(h2_fused)
 
         spatial_seq = torch.stack(spatial_outputs, dim=1).permute(0, 2, 1, 3).reshape(B * N, P, -1)
         gru_out, _ = self.gru(spatial_seq)
@@ -100,7 +111,8 @@ class SpatioTemporalGNN(nn.Module):
         pred_reg_flat = self.regressor(h_context)
         pred_reg = pred_reg_flat.reshape(B, N)
 
-        h_cls_input = torch.cat([h_context, pred_reg_flat.detach()], dim=-1)
+        node_embeds_flat = node_embeds.unsqueeze(0).expand(B, N, -1).reshape(B * N, -1)
+        h_cls_input = torch.cat([h_context, pred_reg_flat, node_embeds_flat], dim=-1)
         pred_cls = self.classifier(h_cls_input).reshape(B, N)
 
         return pred_reg, pred_cls

@@ -19,44 +19,66 @@ from src.step04_model_stgcn import SpatioTemporalGNN
 def format_seconds(seconds):
     return str(timedelta(seconds=int(seconds)))
 
-# Focal Tversky Loss: Penaliza 3 veces más a los Falsos Negativos que a los Falsos Positivos
-class FocalTverskyLoss(nn.Module):
-    def __init__(self, alpha=0.25, beta=0.75, gamma=1.33, eps=1e-6):
-        super(FocalTverskyLoss, self).__init__()
+# Pérdida de Regresión Ponderada para Forzar el Aprendizaje de Picos Epidémicos
+class PeakAwareRegressionLoss(nn.Module):
+    def __init__(self, delta=1.0, peak_weight=2.5):
+        super(PeakAwareRegressionLoss, self).__init__()
+        self.delta = delta
+        self.peak_weight = peak_weight
+
+    def forward(self, pred, target, is_outbreak):
+        abs_err = torch.abs(pred - target)
+        huber = torch.where(
+            abs_err <= self.delta,
+            0.5 * (abs_err ** 2),
+            self.delta * (abs_err - 0.5 * self.delta)
+        )
+        # Pondera más alto el error cuando el distrito está en brote
+        weight = torch.where(is_outbreak > 0.5, self.peak_weight, 1.0)
+        return (weight * huber).mean()
+
+class PerNodeFocalLoss(nn.Module):
+    def __init__(self, alpha=0.60, gamma=2.0, pos_weight=3.5):
+        super(PerNodeFocalLoss, self).__init__()
         self.alpha = alpha
-        self.beta = beta
         self.gamma = gamma
-        self.eps = eps
+        self.pos_weight = pos_weight
 
     def forward(self, logits, targets):
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         probs = torch.sigmoid(logits)
-        
-        tp = torch.sum(probs * targets)
-        fp = torch.sum(probs * (1.0 - targets))
-        fn = torch.sum((1.0 - probs) * targets)
-        
-        tversky_idx = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
-        focal_tversky = torch.pow(1.0 - tversky_idx, 1.0 / self.gamma)
-        return focal_tversky
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        focal_weight = torch.pow(1.0 - p_t, self.gamma)
+        class_weight = targets * (self.alpha * self.pos_weight) + (1.0 - targets) * (1.0 - self.alpha)
+        return (focal_weight * class_weight * bce).mean()
 
-def find_optimal_hybrid_weights(y_true, y_probs, y_reg_preds, thresholds_vec):
-    y_reg_indicator = (y_reg_preds >= thresholds_vec).astype(float)
+def calibrate_scale_aware_gate(y_true, y_probs_cls, y_pred_reg, thresholds_vec, stds_vec):
+    """Calibración protegida contra desbordamientos numéricos (exp overflow)."""
+    denom = np.where(stds_vec < 1e-3, 1.0, stds_vec)
+    z_excess = (y_pred_reg - thresholds_vec) / denom
+    
+    # Clip numérico para eliminar RuntimeWarning: overflow in exp
+    z_clipped = np.clip(-1.5 * z_excess, -30.0, 30.0)
+    prob_physical = 1.0 / (1.0 + np.exp(z_clipped))
     
     best_f1 = 0.0
-    best_alpha = 0.5
-    best_cutoff = 0.5
+    best_w = 0.50
+    best_cutoff = 0.50
 
-    for alpha in [0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9]:
-        combined_score = alpha * y_probs + (1.0 - alpha) * y_reg_indicator
-        for cutoff in np.linspace(0.15, 0.80, 66):
-            preds = (combined_score >= cutoff).astype(int)
+    weights = [0.10, 0.25, 0.40, 0.50, 0.60, 0.70, 0.85]
+    cutoffs = np.linspace(0.20, 0.80, 61)
+
+    for w in weights:
+        combined_score = w * y_probs_cls + (1.0 - w) * prob_physical
+        for c in cutoffs:
+            preds = (combined_score >= c).astype(int)
             score = f1_score(y_true, preds, average="macro", zero_division=0)
             if score > best_f1:
                 best_f1 = score
-                best_alpha = alpha
-                best_cutoff = cutoff
+                best_w = w
+                best_cutoff = c
 
-    return best_alpha, best_cutoff, best_f1
+    return best_w, best_cutoff, best_f1
 
 def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cls, y_pred_cls, figures_dir):
     os.makedirs(figures_dir, exist_ok=True)
@@ -66,7 +88,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     plt.figure(figsize=(8, 5))
     plt.plot(history["train_loss"], label="Train Loss", color="#1f77b4", linewidth=2)
     plt.plot(history["val_loss"], label="Val Loss", color="#ff7f0e", linewidth=2)
-    plt.title("Evolución de Pérdida (Huber + Focal Tversky Loss)", fontsize=12, fontweight="bold")
+    plt.title("Evolución de Pérdida Multitarea (ST-GNN Optimizado)", fontsize=12, fontweight="bold")
     plt.xlabel("Épocas")
     plt.ylabel("Loss")
     plt.legend()
@@ -74,13 +96,13 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     plt.savefig(os.path.join(figures_dir, "01_curvas_aprendizaje.png"), dpi=300)
     plt.close()
 
-    # 2. Matriz de Confusión Calibrada
+    # 2. Matriz de Confusión
     cm = confusion_matrix(y_true_cls, y_pred_cls)
     cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm_norm, annot=True, fmt=".2%", cmap="Blues", cbar=False,
                 xticklabels=["Normal (0)", "Brote (1)"], yticklabels=["Normal (0)", "Brote (1)"])
-    plt.title("Matriz de Confusión Calibrada (Brotes Epidémicos)", fontsize=12, fontweight="bold")
+    plt.title("Matriz de Confusión Calibrada (Alertas de Brote)", fontsize=12, fontweight="bold")
     plt.xlabel("Predicción del Modelo")
     plt.ylabel("Estado Real Notificado")
     plt.tight_layout()
@@ -96,7 +118,7 @@ def plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_prob_cl
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     axes[0].plot(fpr, tpr, color="#2ca02c", lw=2, label=f"AUC-ROC = {roc_auc:.3f}")
     axes[0].plot([0, 1], [0, 1], color="gray", linestyle="--")
-    axes[0].set_title("Curva ROC (Brotes)", fontweight="bold")
+    axes[0].set_title("Curva ROC (Detección de Brotes)", fontweight="bold")
     axes[0].set_xlabel("Tasa Falsos Positivos")
     axes[0].set_ylabel("Tasa Verdaderos Positivos")
     axes[0].legend(loc="lower right")
@@ -145,6 +167,8 @@ def train_and_evaluate():
     edge_index = graph_data["edge_index"].to(device)
     num_nodes = graph_data["num_nodes"]
 
+    tensor_data = np.load(os.path.join(processed_dir, "tensor_eda_TNF.npy"))
+    stds_vec = np.std(tensor_data[:, :, 0], axis=0)
     thresholds_path = os.path.join(processed_dir, "district_thresholds.npy")
     district_thresholds = np.load(thresholds_path) if os.path.exists(thresholds_path) else np.full(num_nodes, 2.0)
 
@@ -152,14 +176,16 @@ def train_and_evaluate():
     accum_steps = config["model_params"].get("gradient_accumulation_steps", 4)
     num_features = len(config["data_processing"]["features"])
 
-    model = SpatioTemporalGNN(num_nodes=num_nodes, in_features=num_features, embed_dim=16, hidden_dim=hidden_dim, dropout=0.15).to(device)
+    model = SpatioTemporalGNN(
+        num_nodes=num_nodes, in_features=num_features, embed_dim=16, hidden_dim=hidden_dim, dropout=0.15
+    ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["model_params"]["learning_rate"], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=25, T_mult=1, eta_min=1e-5)
     scaler_amp = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
-    criterion_reg = nn.HuberLoss(delta=1.0)
-    criterion_tversky = FocalTverskyLoss(alpha=0.25, beta=0.75, gamma=1.33)
+    criterion_reg = PeakAwareRegressionLoss(delta=1.0, peak_weight=2.5)
+    criterion_cls = PerNodeFocalLoss(alpha=0.60, gamma=2.0, pos_weight=float(scalers["pos_weight"]))
 
     epochs = config["model_params"]["epochs"]
     best_val_loss = float("inf")
@@ -177,7 +203,7 @@ def train_and_evaluate():
     start_total_secs = time.time()
 
     print("\n" + "="*85)
-    print(f" ENTRENAMIENTO CON FOCAL TVERSKY LOSS | Inicio: {time_start_global.strftime('%H:%M:%S')}")
+    print(f" INICIO ENTRENAMIENTO ST-GNN POTENCIADO (STAN + KAPOOR) | Hora: {time_start_global.strftime('%H:%M:%S')}")
     print("="*85)
 
     for epoch in range(1, epochs + 1):
@@ -194,9 +220,9 @@ def train_and_evaluate():
             with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 pred_reg, pred_cls = model(batch_x, edge_index)
                 
-                loss_r = criterion_reg(pred_reg, batch_y_reg)
-                loss_c = criterion_tversky(pred_cls, batch_y_cls)
-                total_loss = (loss_r + 2.5 * loss_c) / accum_steps
+                loss_r = criterion_reg(pred_reg, batch_y_reg, batch_y_cls)
+                loss_c = criterion_cls(pred_cls, batch_y_cls)
+                total_loss = (loss_r + 1.8 * loss_c) / accum_steps
 
             scaler_amp.scale(total_loss).backward()
 
@@ -222,9 +248,9 @@ def train_and_evaluate():
                     batch_y_cls = batch_y_cls.to(device)
 
                     pred_reg, pred_cls = model(batch_x, edge_index)
-                    l_r = criterion_reg(pred_reg, batch_y_reg)
-                    l_c = criterion_tversky(pred_cls, batch_y_cls)
-                    val_loss += (l_r + 2.5 * l_c).item()
+                    l_r = criterion_reg(pred_reg, batch_y_reg, batch_y_cls)
+                    l_c = criterion_cls(pred_cls, batch_y_cls)
+                    val_loss += (l_r + 1.8 * l_c).item()
 
         avg_val_loss = val_loss / len(val_loader)
         scheduler.step()
@@ -251,7 +277,7 @@ def train_and_evaluate():
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n[EARLY STOPPING] Detenido en la época {epoch} por estabilización.")
+                print(f"\n[EARLY STOPPING] Detenido en la época {epoch} por convergencia.")
                 break
 
     time_end_global = datetime.now()
@@ -268,7 +294,7 @@ def train_and_evaluate():
     print(f" Épocas Ejecutadas     : {len(history['train_loss'])}")
     print("-"*65 + "\n")
 
-    # 1. Calibración Híbrida en Validación
+    # 1. Calibración Numéricamente Estable sobre Validación
     torch.cuda.empty_cache()
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
@@ -294,13 +320,14 @@ def train_and_evaluate():
     y_val_prob = np.concatenate(val_probs_cls, axis=0).flatten()
     y_val_reg = np.concatenate(val_preds_reg, axis=0).flatten()
 
-    val_samples_count = len(val_loader.dataset)
-    val_thresholds_expanded = np.tile(district_thresholds, val_samples_count)
+    val_count = len(val_loader.dataset)
+    val_thresholds_exp = np.tile(district_thresholds, val_count)
+    val_stds_exp = np.tile(stds_vec, val_count)
 
-    best_alpha, best_cutoff, val_f1 = find_optimal_hybrid_weights(
-        y_val_true, y_val_prob, y_val_reg, val_thresholds_expanded
+    best_w, best_cutoff, val_f1 = calibrate_scale_aware_gate(
+        y_val_true, y_val_prob, y_val_reg, val_thresholds_exp, val_stds_exp
     )
-    print(f"[CALIBRACIÓN] Parámetros Óptimos -> Alpha: {best_alpha:.2f} | Corte: {best_cutoff:.2f} (F1-Val: {val_f1:.4f})")
+    print(f"[CALIBRACIÓN] Parámetros Óptimos -> Peso Neuronal w: {best_w:.2f} | Corte: {best_cutoff:.2f} (F1-Val: {val_f1:.4f})")
 
     # 2. Evaluación en Test y Latencia
     print("[EVALUACIÓN] Evaluando sobre conjunto de Prueba (Test)...")
@@ -336,20 +363,26 @@ def train_and_evaluate():
     y_true_cls = np.concatenate(all_targets_cls, axis=0).flatten()
     y_prob_cls = np.concatenate(all_probs_cls, axis=0).flatten()
 
-    test_thresholds_expanded = np.tile(district_thresholds, total_test_samples)
-    y_reg_indicator = (y_pred_reg >= test_thresholds_expanded).astype(float)
-    y_hybrid_score = best_alpha * y_prob_cls + (1.0 - best_alpha) * y_reg_indicator
-    y_pred_cls = (y_hybrid_score >= best_cutoff).astype(int)
+    test_thresholds_exp = np.tile(district_thresholds, total_test_samples)
+    test_stds_exp = np.tile(stds_vec, total_test_samples)
+
+    denom_test = np.where(test_stds_exp < 1e-3, 1.0, test_stds_exp)
+    z_excess_test = (y_pred_reg - test_thresholds_exp) / denom_test
+    z_clipped_test = np.clip(-1.5 * z_excess_test, -30.0, 30.0)
+    prob_physical_test = 1.0 / (1.0 + np.exp(z_clipped_test))
+    
+    final_score = best_w * y_prob_cls + (1.0 - best_w) * prob_physical_test
+    y_pred_cls = (final_score >= best_cutoff).astype(int)
 
     rmse = float(np.sqrt(mean_squared_error(y_true_reg, y_pred_reg)))
     mae = float(mean_absolute_error(y_true_reg, y_pred_reg))
     r2 = float(r2_score(y_true_reg, y_pred_reg))
     f1_macro = float(f1_score(y_true_cls, y_pred_cls, average="macro"))
     f1_binary = float(f1_score(y_true_cls, y_pred_cls, average="binary"))
-    fpr, tpr, _ = roc_curve(y_true_cls, y_hybrid_score)
+    fpr, tpr, _ = roc_curve(y_true_cls, final_score)
     roc_auc = float(auc(fpr, tpr))
 
-    plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, y_hybrid_score, y_pred_cls, figures_dir)
+    plot_and_save_metrics(history, y_true_reg, y_pred_reg, y_true_cls, final_score, y_pred_cls, figures_dir)
 
     report_data = {
         "CRONOMETRAJE COMPUTACIONAL": {
@@ -366,11 +399,11 @@ def train_and_evaluate():
             "MAE": f"{mae:.4f} casos",
             "R² (Coef. Determinación)": f"{r2:.4f}"
         },
-        "MÉTRICAS DE CLASIFICACIÓN (INFERENCIA HÍBRIDA)": {
+        "MÉTRICAS DE CLASIFICACIÓN (COMPUERTA ESCALAR CALIBRADA)": {
             "F1-Score (Macro)": f"{f1_macro:.4f}",
             "F1-Score (Clase Brote)": f"{f1_binary:.4f}",
             "AUC-ROC": f"{roc_auc:.4f}",
-            "Ponderación Alpha Híbrida": f"{best_alpha:.2f}",
+            "Ponderación Neuronal w": f"{best_w:.2f}",
             "Umbral de Corte": f"{best_cutoff:.2f}"
         }
     }
@@ -381,7 +414,7 @@ def train_and_evaluate():
     print(f" -> Tiempo Total : {format_seconds(total_train_secs)} ({total_train_secs/60:.2f} min)")
     print(f" -> Latencia     : {latency_per_sample:.2f} ms por semana")
     print(f" -> RMSE         : {rmse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
-    print(f" -> F1-Macro     : {f1_macro:.4f} | AUC-ROC: {roc_auc:.4f} (Alpha: {best_alpha:.2f}, Corte: {best_cutoff:.2f})")
+    print(f" -> F1-Macro     : {f1_macro:.4f} | AUC-ROC: {roc_auc:.4f} (w: {best_w:.2f}, Corte: {best_cutoff:.2f})")
     print("="*65 + "\n")
 
 if __name__ == "__main__":
