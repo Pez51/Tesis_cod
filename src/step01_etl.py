@@ -187,6 +187,7 @@ def run_etl():
         "ubigeo_to_idx": ubigeo_to_idx,
         "time_index": time_index,
         "features": features,
+        "feature_names": features,
         "provinces_catalog": unique_provinces.to_dicts(),
         "endemic_channel_q3": endemic_channel_q3,
         "district_thresholds": district_thresholds
