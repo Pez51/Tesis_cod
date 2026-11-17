@@ -1,4 +1,4 @@
-import os
+﻿import os
 import numpy as np
 import pandas as pd
 import torch
@@ -19,8 +19,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1. Cargar datos y obtener errores absolutos del ST-GNN en Test
-    _, _, test_loader, scalers = get_dataloaders(batch_size=32)
-    graph_data = torch.load(os.path.join(processed_dir, "graph_topology.pt"), weights_only=True)
+    _, _, test_loader, scalers = get_dataloaders()
+    graph_data = torch.load(os.path.join(processed_dir, "graph_topology.pt"), weights_only=False)
     edge_index = graph_data["edge_index"].to(device)
     num_nodes = graph_data["num_nodes"]
 
@@ -40,7 +40,7 @@ def main():
         num_nodes=num_nodes, in_features=num_features, embed_dim=8, hidden_dim=64, dropout=0.15
     ).to(device)
     stgnn_model.load_state_dict(
-        torch.load(os.path.join(models_dir, "best_stgnn_model.pt"), map_location=device, weights_only=True)
+        torch.load(os.path.join(models_dir, "best_stgnn_model.pt"), map_location=device, weights_only=False)
     )
     stgnn_model.eval()
 
@@ -68,7 +68,7 @@ def main():
     rf = RandomForestRegressor(n_estimators=50, max_depth=12, random_state=42, n_jobs=-1)
     rf.fit(X_train, np.log1p(y_train_reg))
 
-    # Alinear exactamente a las mismas últimas 184 semanas del Test del ST-GNN
+    # Alinear exactamente a las mismas Ãºltimas 184 semanas del Test del ST-GNN
     n_test_weeks = y_test_reg_true.shape[0]
     start_test_t = T - n_test_weeks
     rf_preds = [np.clip(np.expm1(rf.predict(tensor_data[t - 1, :, :])), 0, None) for t in range(start_test_t, T)]
